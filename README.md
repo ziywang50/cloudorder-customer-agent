@@ -23,6 +23,24 @@ Router (LLM intent classifier — single fast call)
 | Order | Direct (extract → tool → format) | 2 | Order status, tracking, history |
 | CS Agent | ReAct (reason → act → observe loop) | 3-10 | Disputes, refunds, multi-step problems |
 
+User message comes in
+    ↓
+Load conversation history from storage
+    ↓
+Router node: LLM classifies intent (faq / order / complex)
+    ↓
+Conditional routing based on intent
+    ↓
+   ├─ FAQ agent (simple lookup questions)
+   ├─ Order agent (needs user_id, order-related queries)
+   └─ Customer service ReAct agent (complex, multi-step reasoning)
+    ↓
+Response generated
+    ↓
+Save updated history back to storage
+    ↓
+Return response to user
+
 ### Tools Available to CS Agent
 
 - `query_order` — Look up a single order by ID
