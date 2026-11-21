@@ -37,7 +37,7 @@ _SHIPMENT_FIELDS = ("shipmentId", "direction", "carrier", "service", "trackingNu
                     "status", "promisedBy", "deliveredAt", "lastScanAt", "rmaId", "events")
 
 
-def _dump(payload: Any) -> str:
+def to_json(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -46,10 +46,10 @@ def _pick(record: dict[str, Any], fields: tuple[str, ...]) -> dict[str, Any]:
 
 
 def tool_error(code: str, message: str) -> str:
-    return _dump({"error": {"code": code, "message": message}})
+    return to_json({"error": {"code": code, "message": message}})
 
 
-def _backend_error(exc: BackendError, subject: str) -> str:
+def backend_error(exc: BackendError, subject: str) -> str:
     if exc.code == "ORDER_NOT_FOUND":
         return tool_error(exc.code, f"No order {subject} on this customer's account. Do not "
                                     "speculate about whether it exists elsewhere.")
@@ -59,7 +59,7 @@ def _backend_error(exc: BackendError, subject: str) -> str:
     return tool_error(exc.code, exc.message)
 
 
-def _invalid_order_id(order_id: str) -> str | None:
+def invalid_order_id(order_id: str) -> str | None:
     if ORDER_ID.fullmatch(order_id or ""):
         return None
     return tool_error("INVALID_ORDER_ID", "Order IDs look like ORD-123456.")
@@ -123,36 +123,36 @@ def build_read_tools(client: CloudOrderClient) -> dict[str, BaseTool]:
             customer = await client.get_customer(customer_id)
             orders = await client.list_orders(customer_id)
         except BackendError as exc:
-            return _backend_error(exc, "")
-        return _dump(customer_view(customer, orders))
+            return backend_error(exc, "")
+        return to_json(customer_view(customer, orders))
 
     @tool
     async def get_order(order_id: str, runtime: Runtime) -> str:
         """One of this customer's orders: line items with lineIds, unit price, tax and line
         totals in cents, order totals, status, and ship-to city."""
-        if error := _invalid_order_id(order_id):
+        if error := invalid_order_id(order_id):
             return error
         customer_id = runtime.context.customer_id
         try:
             order = await client.get_order(customer_id, order_id)
         except BackendError as exc:
-            return _backend_error(exc, order_id)
+            return backend_error(exc, order_id)
         if order.get("customerId") != customer_id:  # defense in depth if the backend mis-scopes
-            return _backend_error(BackendError(404, "ORDER_NOT_FOUND", ""), order_id)
-        return _dump(order_view(order))
+            return backend_error(BackendError(404, "ORDER_NOT_FOUND", ""), order_id)
+        return to_json(order_view(order))
 
     @tool
     async def get_payment_ledger(order_id: str, runtime: Runtime) -> str:
         """Every payment transaction on an order: authorizations (including voided holds),
         captures, refunds, and chargebacks, with amounts in cents, timestamps, and processor
         notes. Use it to tell real charges apart from authorization holds."""
-        if error := _invalid_order_id(order_id):
+        if error := invalid_order_id(order_id):
             return error
         try:
             payments = await client.get_payments(runtime.context.customer_id, order_id)
         except BackendError as exc:
-            return _backend_error(exc, order_id)
-        return _dump({
+            return backend_error(exc, order_id)
+        return to_json({
             "orderId": order_id,
             "asOf": payments["asOf"],
             "transactions": [_pick(t, _TRANSACTION_FIELDS) for t in payments["transactions"]],
@@ -162,13 +162,13 @@ def build_read_tools(client: CloudOrderClient) -> dict[str, BaseTool]:
     async def get_refund_history(order_id: str, runtime: Runtime) -> str:
         """Refunds already issued on an order, with amount in cents, reason, status, and expected
         settlement date. Check this before recommending any new refund."""
-        if error := _invalid_order_id(order_id):
+        if error := invalid_order_id(order_id):
             return error
         try:
             refunds = await client.get_refunds(runtime.context.customer_id, order_id)
         except BackendError as exc:
-            return _backend_error(exc, order_id)
-        return _dump({"orderId": order_id,
+            return backend_error(exc, order_id)
+        return to_json({"orderId": order_id,
                       "refunds": [_pick(r, _REFUND_FIELDS) for r in refunds["refunds"]]})
 
     @tool
@@ -176,13 +176,13 @@ def build_read_tools(client: CloudOrderClient) -> dict[str, BaseTool]:
         """Shipments for an order, outbound and returns: carrier, tracking number, which lineIds
         each box holds, promised date, last scan, and full scan history. asOf is the backend's
         current time; use it to measure how long ago the last scan was."""
-        if error := _invalid_order_id(order_id):
+        if error := invalid_order_id(order_id):
             return error
         try:
             shipments = await client.get_shipments(runtime.context.customer_id, order_id)
         except BackendError as exc:
-            return _backend_error(exc, order_id)
-        return _dump({
+            return backend_error(exc, order_id)
+        return to_json({
             "orderId": order_id,
             "asOf": shipments["asOf"],
             "shipments": [_pick(s, _SHIPMENT_FIELDS) for s in shipments["shipments"]],
@@ -195,8 +195,8 @@ def build_read_tools(client: CloudOrderClient) -> dict[str, BaseTool]:
         try:
             tickets = await client.list_tickets(runtime.context.customer_id)
         except BackendError as exc:
-            return _backend_error(exc, "")
-        return _dump({"tickets": [ticket_view(t) for t in tickets]})
+            return backend_error(exc, "")
+        return to_json({"tickets": [ticket_view(t) for t in tickets]})
 
     @tool
     async def check_refund_eligibility(
@@ -212,7 +212,7 @@ def build_read_tools(client: CloudOrderClient) -> dict[str, BaseTool]:
         successful capture), lost_package (a shipment that meets the lost rule), or
         damaged_item_keep (customer keeps a damaged item; pass its line_ids). To learn the
         maximum for a reason, pass amount_cents=1."""
-        if error := _invalid_order_id(order_id):
+        if error := invalid_order_id(order_id):
             return error
         line_ids = line_ids or []
         if bad := [line for line in line_ids if not LINE_ID.fullmatch(line)]:
@@ -223,8 +223,8 @@ def build_read_tools(client: CloudOrderClient) -> dict[str, BaseTool]:
                 reason_code=reason_code, line_ids=line_ids,
             )
         except BackendError as exc:
-            return _backend_error(exc, order_id)
-        return _dump(result)
+            return backend_error(exc, order_id)
+        return to_json(result)
 
     tools = [get_customer_overview, get_order, get_payment_ledger, get_refund_history,
              get_shipment_tracking, get_support_tickets, check_refund_eligibility]

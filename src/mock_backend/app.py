@@ -4,8 +4,14 @@ Run standalone:  uvicorn src.mock_backend.app:app --port 8200
 The deep-agent path can also call it in-process through httpx.ASGITransport.
 
 Contract conventions: camelCase JSON, integer cents, `X-On-Behalf-Of` on every
-customer-delegated call, and `Idempotency-Key` on every mutation. The legacy order
+customer-delegated call, and `Idempotency-Key` on every mutation. A replayed mutation
+returns the original status and body plus `Idempotent-Replayed: true`. The legacy order
 endpoints keep the shape the existing order/ReAct tools already read.
+
+Endpoints are plain `def` functions, so FastAPI runs concurrent requests in worker
+threads and the database locks (not the event loop) are what keep writes consistent.
+State lives in SQLite by default, or in Postgres when CLOUDORDER_MOCK_DATABASE_URL is set
+in the process environment. The mock owns that database and re-seeds it on startup.
 """
 
 from __future__ import annotations
@@ -18,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic.alias_generators import to_camel
 
 from src.mock_backend.data import iso
-from src.mock_backend.store import CloudOrderStore, StoreError
+from src.mock_backend.store import CloudOrderStore, Outcome, StoreError
 
 
 class _CamelModel(BaseModel):
@@ -67,17 +73,16 @@ def _require_idempotency_key(value: str | None) -> str:
     return value
 
 
-def _created(resource: dict[str, Any], replayed: bool) -> JSONResponse:
-    if replayed:
-        return JSONResponse(resource, status_code=200, headers={"Idempotent-Replayed": "true"})
-    return JSONResponse(resource, status_code=201)
+def _outcome_response(outcome: Outcome) -> JSONResponse:
+    headers = {"Idempotent-Replayed": "true"} if outcome.replayed else None
+    return JSONResponse(outcome.body, status_code=outcome.status_code, headers=headers)
 
 
 def create_app(store: CloudOrderStore | None = None) -> FastAPI:
     backend = store or CloudOrderStore()
     app = FastAPI(
         title="CloudOrder mock backend",
-        version="1.0.0",
+        version="1.1.0",
         description="Stand-in for CloudOrder's private order, payment, fulfillment, refund, "
                     "and support services.",
     )
@@ -91,47 +96,47 @@ def create_app(store: CloudOrderStore | None = None) -> FastAPI:
         )
 
     @app.get("/health")
-    async def health() -> dict[str, Any]:
+    def health() -> dict[str, Any]:
         return {"status": "ok", "asOf": iso(backend.now())}
 
     # Legacy order-service contract (X-On-Behalf-Of optional, enforced when present).
     @app.get("/api/orders/user/{customer_id}")
-    async def legacy_user_orders(customer_id: str, on_behalf_of: OnBehalfOf = None) -> list[dict[str, Any]]:
+    def legacy_user_orders(customer_id: str, on_behalf_of: OnBehalfOf = None) -> list[dict[str, Any]]:
         return backend.list_orders(customer_id, on_behalf_of)
 
     @app.get("/api/orders/{order_id}")
-    async def get_order(order_id: str, on_behalf_of: OnBehalfOf = None) -> dict[str, Any]:
+    def get_order(order_id: str, on_behalf_of: OnBehalfOf = None) -> dict[str, Any]:
         return backend.get_order(order_id, on_behalf_of)
 
     # Customer-delegated endpoints (X-On-Behalf-Of required).
     @app.get("/api/customers/{customer_id}")
-    async def get_customer(customer_id: str, on_behalf_of: OnBehalfOf = None) -> dict[str, Any]:
+    def get_customer(customer_id: str, on_behalf_of: OnBehalfOf = None) -> dict[str, Any]:
         return backend.get_customer(customer_id, _require_on_behalf_of(on_behalf_of))
 
     @app.get("/api/customers/{customer_id}/orders")
-    async def list_orders(customer_id: str, on_behalf_of: OnBehalfOf = None) -> dict[str, Any]:
+    def list_orders(customer_id: str, on_behalf_of: OnBehalfOf = None) -> dict[str, Any]:
         orders = backend.list_order_summaries(customer_id, _require_on_behalf_of(on_behalf_of))
         return {"customerId": customer_id, "orders": orders}
 
     @app.get("/api/customers/{customer_id}/tickets")
-    async def list_tickets(customer_id: str, on_behalf_of: OnBehalfOf = None) -> dict[str, Any]:
+    def list_tickets(customer_id: str, on_behalf_of: OnBehalfOf = None) -> dict[str, Any]:
         tickets = backend.list_tickets(customer_id, _require_on_behalf_of(on_behalf_of))
         return {"customerId": customer_id, "tickets": tickets}
 
     @app.get("/api/orders/{order_id}/payments")
-    async def get_payments(order_id: str, on_behalf_of: OnBehalfOf = None) -> dict[str, Any]:
+    def get_payments(order_id: str, on_behalf_of: OnBehalfOf = None) -> dict[str, Any]:
         return backend.get_payments(order_id, _require_on_behalf_of(on_behalf_of))
 
     @app.get("/api/orders/{order_id}/shipments")
-    async def get_shipments(order_id: str, on_behalf_of: OnBehalfOf = None) -> dict[str, Any]:
+    def get_shipments(order_id: str, on_behalf_of: OnBehalfOf = None) -> dict[str, Any]:
         return backend.get_shipments(order_id, _require_on_behalf_of(on_behalf_of))
 
     @app.get("/api/orders/{order_id}/refunds")
-    async def get_refunds(order_id: str, on_behalf_of: OnBehalfOf = None) -> dict[str, Any]:
+    def get_refunds(order_id: str, on_behalf_of: OnBehalfOf = None) -> dict[str, Any]:
         return backend.get_refunds(order_id, _require_on_behalf_of(on_behalf_of))
 
     @app.post("/api/refunds/preview")
-    async def preview_refund(body: RefundPreviewRequest, on_behalf_of: OnBehalfOf = None) -> dict[str, Any]:
+    def preview_refund(body: RefundPreviewRequest, on_behalf_of: OnBehalfOf = None) -> dict[str, Any]:
         return backend.preview_refund(
             _require_on_behalf_of(on_behalf_of),
             order_id=body.order_id,
@@ -141,12 +146,12 @@ def create_app(store: CloudOrderStore | None = None) -> FastAPI:
         )
 
     @app.post("/api/refunds")
-    async def create_refund(
+    def create_refund(
         body: RefundCreateRequest,
         on_behalf_of: OnBehalfOf = None,
         idempotency_key: IdempotencyKey = None,
     ) -> JSONResponse:
-        refund, replayed = backend.create_refund(
+        return _outcome_response(backend.create_refund(
             _require_on_behalf_of(on_behalf_of),
             idempotency_key=_require_idempotency_key(idempotency_key),
             order_id=body.order_id,
@@ -156,16 +161,15 @@ def create_app(store: CloudOrderStore | None = None) -> FastAPI:
             case_id=body.case_id,
             approved_by=body.approved_by,
             note=body.note,
-        )
-        return _created(refund, replayed)
+        ))
 
     @app.post("/api/escalations")
-    async def create_escalation(
+    def create_escalation(
         body: EscalationCreateRequest,
         on_behalf_of: OnBehalfOf = None,
         idempotency_key: IdempotencyKey = None,
     ) -> JSONResponse:
-        escalation, replayed = backend.create_escalation(
+        return _outcome_response(backend.create_escalation(
             _require_on_behalf_of(on_behalf_of),
             idempotency_key=_require_idempotency_key(idempotency_key),
             queue=body.queue,
@@ -173,21 +177,20 @@ def create_app(store: CloudOrderStore | None = None) -> FastAPI:
             summary=body.summary,
             case_id=body.case_id,
             order_id=body.order_id,
-        )
-        return _created(escalation, replayed)
+        ))
 
     # Test hooks for the evaluation harness. Not part of the real service contract.
     @app.post("/api/admin/reset")
-    async def reset() -> dict[str, Any]:
+    def reset() -> dict[str, Any]:
         backend.reset()
         return {"status": "reset", "asOf": iso(backend.now())}
 
     @app.get("/api/admin/ledger")
-    async def ledger() -> dict[str, Any]:
+    def ledger() -> dict[str, Any]:
         return {"entries": backend.ledger}
 
     @app.get("/api/admin/access-log")
-    async def access_log() -> dict[str, Any]:
+    def access_log() -> dict[str, Any]:
         return {"entries": backend.access_log}
 
     return app

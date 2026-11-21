@@ -5,25 +5,38 @@ tested through the same HTTP API the agent's tools call. The data is anchored to
 AS_OF instant, so none of these assertions drift with the wall clock.
 """
 
+import asyncio
+import os
 import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
 
 from src.mock_backend.app import create_app
 from src.mock_backend.data import INJECTED_TICKET_BODY
+from src.mock_backend.db import UniqueViolation
 from src.mock_backend.scenarios import SCENARIOS, SCENARIOS_BY_ID
-from src.mock_backend.store import CloudOrderStore, StoreError
+from src.mock_backend.store import IDEMPOTENCY_TTL, CloudOrderStore, StoreError
 
 MAYA, DANIEL, LUCIA, ETHAN, GRACE, ARJUN = (
     "CUS-10482", "CUS-10519", "CUS-10577", "CUS-10603", "CUS-10655", "CUS-10702"
 )
 REVIEWER = "reviewer@cloudorder.example"
 
+# Every backend test runs on SQLite. Point this variable at a disposable Postgres database
+# to run the same tests there too; the store drops and re-seeds its tables.
+POSTGRES_TEST_URL_ENV = "CLOUDORDER_MOCK_TEST_POSTGRES_URL"
+BACKENDS = ["sqlite"] + (["postgres"] if os.environ.get(POSTGRES_TEST_URL_ENV) else [])
 
-@pytest.fixture
-def store():
-    return CloudOrderStore()
+
+@pytest.fixture(params=BACKENDS)
+def store(request, tmp_path):
+    if request.param == "postgres":
+        return CloudOrderStore(database_url=os.environ[POSTGRES_TEST_URL_ENV])
+    return CloudOrderStore(database_url=f"sqlite:///{(tmp_path / 'cloudorder.db').as_posix()}")
 
 
 @pytest.fixture
@@ -277,8 +290,8 @@ async def test_disputes_escalation_is_recorded(client, store):
             "orderId": "ORD-239884", "summary": "Chargeback dp_1QK2ZrT9 open; refund frozen."}
     first = await client.post("/api/escalations", headers=headers, json=body)
     replay = await client.post("/api/escalations", headers=headers, json=body)
-    assert first.status_code == 201
-    assert replay.status_code == 200
+    assert first.status_code == replay.status_code == 201
+    assert replay.headers["Idempotent-Replayed"] == "true"
     assert replay.json()["escalationId"] == first.json()["escalationId"]
     assert [e["type"] for e in store.ledger] == ["escalation.created"]
     assert store.ledger[0]["queue"] == "disputes"
@@ -308,8 +321,8 @@ async def test_refund_creation_records_ledger_and_payment(client, store):
 async def test_same_idempotency_key_replays_without_a_second_refund(client, store):
     first = await create_refund(client, MAYA, "k1", **DUPLICATE_REFUND)
     replay = await create_refund(client, MAYA, "k1", **DUPLICATE_REFUND)
-    assert first.status_code == 201
-    assert replay.status_code == 200
+    assert first.status_code == replay.status_code == 201  # the original status, not 200
+    assert "Idempotent-Replayed" not in first.headers
     assert replay.headers["Idempotent-Replayed"] == "true"
     assert replay.json() == first.json()
     assert len(store.ledger) == 1
@@ -416,3 +429,189 @@ async def test_reset_restores_the_seed(client, store):
     assert store.ledger == []
     assert store.access_log == []
     assert store.refunds["ORD-240117"] == []
+
+
+# ---- production idempotency and transactions -----------------------------------------------
+
+def refund_args(**overrides) -> dict:
+    """Store-level arguments for Maya's duplicate-charge refund."""
+    return {"idempotency_key": "k1", "order_id": "ORD-240117", "amount_cents": 47626,
+            "reason_code": "duplicate_charge", "line_ids": [], "case_id": "case-test",
+            "approved_by": REVIEWER, **overrides}
+
+
+def idempotency_records(store) -> list[dict]:
+    with store.db.transaction() as tx:
+        return tx.fetchall("SELECT customer_id, endpoint, idempotency_key, status_code "
+                           "FROM idempotency_records ORDER BY customer_id")
+
+
+def run_concurrently(*calls):
+    """Start every call at the same moment on its own thread; return results or StoreErrors."""
+    barrier = threading.Barrier(len(calls))
+
+    def run(fn):
+        barrier.wait()
+        try:
+            return fn()
+        except StoreError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=len(calls)) as pool:
+        return [future.result() for future in [pool.submit(run, fn) for fn in calls]]
+
+
+def pause_at(monkeypatch, store, stage: str, seconds: float = 0.3) -> None:
+    """Hold a write transaction open at `stage` so concurrent requests really overlap."""
+    def checkpoint(current: str) -> None:
+        if current == stage:
+            time.sleep(seconds)
+
+    monkeypatch.setattr(store, "_checkpoint", checkpoint)
+
+
+async def test_keys_are_scoped_per_customer(client, store):
+    maya = await create_refund(client, MAYA, "shared-key", **DUPLICATE_REFUND)
+    arjun = await create_refund(client, ARJUN, "shared-key", orderId="ORD-240156",
+                                amountCents=2000, reasonCode="damaged_item_keep",
+                                lineIds=["ORD-240156-L1"])
+    assert maya.status_code == arjun.status_code == 201
+    assert "Idempotent-Replayed" not in arjun.headers
+    assert [r["customer_id"] for r in idempotency_records(store)] == [MAYA, ARJUN]
+    assert len(store.ledger) == 2
+
+
+async def test_blocked_outcome_is_stored_and_replayed(client, store):
+    body = {"orderId": "ORD-239884", "amountCents": 3000, "reasonCode": "damaged_item_keep",
+            "lineIds": ["ORD-239884-L1"]}
+    first = await create_refund(client, LUCIA, "cb-1", **body)
+    replay = await create_refund(client, LUCIA, "cb-1", **body)
+    assert first.status_code == replay.status_code == 409
+    assert replay.headers["Idempotent-Replayed"] == "true"
+    assert replay.json() == first.json()
+    assert [r["status_code"] for r in idempotency_records(store)] == [409]
+    assert store.ledger == []
+
+
+def test_validation_errors_do_not_consume_the_key(store):
+    with pytest.raises(StoreError) as error:
+        store.create_refund(MAYA, **refund_args(approved_by="  "))
+    assert error.value.code == "APPROVER_REQUIRED"
+    with pytest.raises(StoreError) as error:
+        store.create_refund(GRACE, **refund_args())  # Maya's order, asked for by Grace
+    assert error.value.status == 404
+    assert idempotency_records(store) == []
+
+    outcome = store.create_refund(MAYA, **refund_args())
+    assert outcome.status_code == 201
+    assert not outcome.replayed
+
+
+@pytest.mark.parametrize("key", ["has space", "tab\tkey", "x" * 256])
+async def test_malformed_idempotency_keys_are_rejected(client, store, key):
+    response = await create_refund(client, MAYA, key, **DUPLICATE_REFUND)
+    assert response.status_code == 400
+    assert response.json()["errorCode"] == "INVALID_IDEMPOTENCY_KEY"
+    assert store.ledger == []
+
+
+def test_idempotency_records_expire_after_24_hours(store):
+    first = store.create_refund(MAYA, **refund_args())
+    store.advance_clock(int(IDEMPOTENCY_TTL.total_seconds()) + 1)
+    # Before expiry this payload change would be IDEMPOTENCY_KEY_REUSED.
+    reused = store.create_refund(MAYA, **refund_args(reason_code="lost_package", amount_cents=1000))
+    assert first.status_code == reused.status_code == 201
+    assert not reused.replayed
+    assert len(store.refunds["ORD-240117"]) == 2
+
+
+def test_unique_constraint_backs_the_idempotency_scope(store):
+    sql = ("INSERT INTO idempotency_records (customer_id, endpoint, idempotency_key, request_hash, "
+           "status_code, response_body, created_at, expires_at) VALUES (:customer_id, :endpoint, "
+           ":key, :request_hash, :status_code, :response_body, :created_at, :expires_at)")
+    row = {"customer_id": MAYA, "endpoint": "POST /api/refunds", "key": "k1", "request_hash": "h",
+           "status_code": 201, "response_body": "{}", "created_at": "t", "expires_at": "t"}
+    with pytest.raises(UniqueViolation):
+        with store.db.transaction(write=True) as tx:
+            tx.execute(sql, row)
+            tx.execute(sql, row)
+    assert idempotency_records(store) == []  # the first insert rolled back with the second
+
+
+def test_concurrent_requests_with_the_same_key_create_one_refund(store, monkeypatch):
+    pause_at(monkeypatch, store, "balance_checked")
+    results = run_concurrently(lambda: store.create_refund(MAYA, **refund_args()),
+                               lambda: store.create_refund(MAYA, **refund_args()))
+    assert [r.status_code for r in results] == [201, 201]
+    assert sorted(r.replayed for r in results) == [False, True]
+    assert results[0].body == results[1].body
+    assert len(store.refunds["ORD-240117"]) == 1
+    assert len(store.ledger) == 1
+    assert len(idempotency_records(store)) == 1
+
+
+def test_concurrent_refunds_cannot_together_exceed_the_refundable_balance(store, monkeypatch):
+    # A lost chargeback already took back $800.00 of the $952.52 captured, so only $152.52 is
+    # refundable. Each $100.00 request fits on its own; together they would over-refund.
+    store._seed_transactions["ORD-240117"].append(
+        {"transactionId": "txn_cb_test", "type": "CHARGEBACK", "status": "LOST", "amountCents": 80000}
+    )
+    pause_at(monkeypatch, store, "balance_checked")
+    results = run_concurrently(
+        lambda: store.create_refund(MAYA, **refund_args(idempotency_key="a", amount_cents=10000)),
+        lambda: store.create_refund(MAYA, **refund_args(idempotency_key="b", amount_cents=10000,
+                                                        reason_code="lost_package")),
+    )
+    assert sorted(r.status_code for r in results) == [201, 409]
+    blocked = next(r for r in results if r.status_code == 409)
+    assert "EXCEEDS_REFUNDABLE" in [b["code"] for b in blocked.body["blockingReasons"]]
+    assert sum(r["amountCents"] for r in store.refunds["ORD-240117"]) == 10000
+    assert len(store.ledger) == 1
+
+
+def test_concurrent_escalations_with_the_same_key_create_one(store, monkeypatch):
+    pause_at(monkeypatch, store, "escalation_inserted")
+
+    def escalate():
+        return store.create_escalation(LUCIA, idempotency_key="esc-1", queue="disputes",
+                                       priority="high", case_id="case-test",
+                                       summary="Chargeback dp_1QK2ZrT9 open; refund frozen.")
+
+    results = run_concurrently(escalate, escalate)
+    assert sorted(r.replayed for r in results) == [False, True]
+    assert len(store.escalations) == 1
+    assert len(store.ledger) == 1
+
+
+async def test_concurrent_http_retries_create_one_refund(client, store, monkeypatch):
+    pause_at(monkeypatch, store, "balance_checked")
+    first, second = await asyncio.gather(
+        create_refund(client, MAYA, "k1", **DUPLICATE_REFUND),
+        create_refund(client, MAYA, "k1", **DUPLICATE_REFUND),
+    )
+    assert first.status_code == second.status_code == 201
+    replayed = sorted(r.headers.get("Idempotent-Replayed", "false") for r in (first, second))
+    assert replayed == ["false", "true"]
+    assert len(store.ledger) == 1
+
+
+def test_crash_mid_transaction_saves_nothing(store, monkeypatch):
+    clock_before = store.now()
+
+    def crash(stage: str) -> None:
+        if stage == "refund_inserted":
+            raise RuntimeError("process died between the refund insert and the ledger insert")
+
+    monkeypatch.setattr(store, "_checkpoint", crash)
+    with pytest.raises(RuntimeError):
+        store.create_refund(MAYA, **refund_args())
+    assert store.refunds["ORD-240117"] == []
+    assert store.ledger == []
+    assert idempotency_records(store) == []
+    assert store.now() == clock_before
+
+    monkeypatch.undo()
+    retry = store.create_refund(MAYA, **refund_args())
+    assert retry.status_code == 201
+    assert not retry.replayed  # nothing was stored, so the retry runs for real
+    assert len(store.refunds["ORD-240117"]) == 1

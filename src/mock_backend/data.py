@@ -304,7 +304,6 @@ def build_seed() -> dict[str, Any]:
         "orders": {},
         "transactions": {},
         "shipments": {},
-        "refunds": {},
         "tickets": {customer_id: [] for customer_id in customers},
     }
 
@@ -313,7 +312,6 @@ def build_seed() -> dict[str, Any]:
         seed["orders"][order_id] = order
         seed["transactions"][order_id] = transactions
         seed["shipments"][order_id] = shipments
-        seed["refunds"][order_id] = []
 
     def routine(
         order_id: str,
