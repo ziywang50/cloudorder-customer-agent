@@ -4,6 +4,8 @@ A planning coordinator delegates to three read-only investigator sub-agents. Eac
 sub-agent sees only the tools its job needs, works in its own context window, and writes
 its evidence to the case's virtual filesystem. Company policies are mounted read-only at
 /policies/. Case files live in graph state, so the checkpointer persists them per case.
+Guardrails (see guardrails.py) wrap both layers: a fail-closed tenant check on every tool
+call, call budgets per run and per case, and a check on what the final reply claims.
 """
 
 from __future__ import annotations
@@ -28,13 +30,17 @@ from langgraph.checkpoint.memory import InMemorySaver
 
 from src.deep_agent.actions import (
     EXECUTE_REFUND,
-    CaseStateMiddleware,
     build_action_tools,
     refund_review_card,
 )
 from src.deep_agent.backend import CloudOrderClient
 from src.deep_agent.config import DeepAgentSettings, get_settings
 from src.deep_agent.context import CaseContext
+from src.deep_agent.guardrails import (
+    CaseGuardrailMiddleware,
+    coordinator_limits,
+    subagent_limits,
+)
 from src.deep_agent.prompts import (
     BILLING_PROMPT,
     COORDINATOR_PROMPT,
@@ -116,6 +122,7 @@ def build_case_agent(
             "tools": [tools[tool_name] for tool_name in tool_names],
             "model": subagent_model,
             "interrupt_on": {},  # read-only: nothing to approve
+            "middleware": subagent_limits(),
         }
         for name, (prompt, tool_names) in SUBAGENTS.items()
     ]
@@ -123,7 +130,7 @@ def build_case_agent(
         model=model,
         tools=[tools[name] for name in COORDINATOR_TOOLS],
         system_prompt=COORDINATOR_PROMPT,
-        middleware=[TodoListMiddleware(), CaseStateMiddleware()],
+        middleware=[TodoListMiddleware(), CaseGuardrailMiddleware(), *coordinator_limits()],
         subagents=subagents,
         backend=case_backend(),
         permissions=POLICY_PERMISSIONS,

@@ -22,7 +22,9 @@ to write.
 4. Investigators write evidence to /case/evidence/<name>.md. Read those files when you need \
 detail. Company policies are in /policies/ and are read-only.
 5. Base every statement on tool results or evidence files. If something is unknown, say so. \
-Never guess amounts, dates, or statuses.
+Never guess amounts, dates, or statuses. If an investigator reports that it stopped early \
+(for example "Model call limits exceeded"), do not fill the gap yourself: tell the customer \
+what is confirmed and escalate the rest to tier2_support.
 
 Remedies and actions:
 - Only after the policy analyst confirms a refund is eligible, call propose_refund for it: \

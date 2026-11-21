@@ -15,7 +15,7 @@ import hashlib
 import operator
 from typing import Annotated, Any, Literal, NotRequired
 
-from langchain.agents.middleware import AgentMiddleware, AgentState
+from langchain.agents.middleware import AgentState
 from langchain.agents.middleware.types import PrivateStateAttr
 from langchain.tools import tool
 from langchain_core.messages import ToolMessage
@@ -48,16 +48,13 @@ class CaseState(AgentState):
     Both channels are private: they are not part of the graph's input or output schema, so
     a caller cannot inject a proposal, and deepagents does not copy them to sub-agents.
     Only propose_refund, execute_refund, and escalate_case write to them.
+
+    guardrails.CaseGuardrailMiddleware registers this schema (via GuardrailState) on the
+    coordinator graph.
     """
 
     refund_proposals: NotRequired[Annotated[dict[str, dict[str, Any]], PrivateStateAttr, _merge]]
     action_receipts: NotRequired[Annotated[list[dict[str, Any]], PrivateStateAttr, operator.add]]
-
-
-class CaseStateMiddleware(AgentMiddleware):
-    """Registers CaseState on the coordinator graph."""
-
-    state_schema = CaseState
 
 
 def usd(cents: int) -> str:

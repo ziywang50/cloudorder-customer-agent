@@ -21,7 +21,7 @@ from langgraph.types import Command
 from src.deep_agent.actions import EXECUTE_REFUND
 from src.deep_agent.context import CaseContext
 
-CaseStatus = Literal["awaiting_approval", "completed"]
+CaseStatus = Literal["awaiting_approval", "completed", "stopped"]
 
 
 @dataclass(frozen=True)
@@ -46,6 +46,7 @@ class CaseSnapshot:
     todos: list[dict[str, Any]] = field(default_factory=list)
     files: list[str] = field(default_factory=list)
     receipts: list[dict[str, Any]] = field(default_factory=list)
+    guardrail_events: list[dict[str, Any]] = field(default_factory=list)
 
 
 class CaseError(ValueError):
@@ -106,15 +107,22 @@ class CaseService:
         if not approvals:
             last = next((m for m in reversed(values.get("messages", [])) if isinstance(m, AIMessage)), None)
             reply = last.text if last is not None else None
+        if approvals:
+            status: CaseStatus = "awaiting_approval"
+        elif values.get("stopped_reason"):
+            status = "stopped"
+        else:
+            status = "completed"
         return CaseSnapshot(
             case_id=case_id,
             customer_id=customer_id,
-            status="awaiting_approval" if approvals else "completed",
+            status=status,
             reply=reply,
             approvals=approvals,
             todos=list(values.get("todos") or []),
             files=sorted(values.get("files") or {}),
             receipts=list(values.get("action_receipts") or []),
+            guardrail_events=list(values.get("guardrail_events") or []),
         )
 
     async def submit_decisions(

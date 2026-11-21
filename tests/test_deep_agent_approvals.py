@@ -65,7 +65,8 @@ async def test_flagship_refunds_wait_for_approval_then_execute(client, app):
         AIMessage("", tool_calls=[propose("p1", "ORD-240117", "duplicate_charge", 47626),
                                   propose("p2", "ORD-240117", "lost_package", 11905)]),
         AIMessage("", tool_calls=[execute("e1", DUP, 47626), execute("e2", LOST, 11905)]),
-        AIMessage("Refunds RF-90001 ($476.26) and RF-90002 ($119.05) were issued."),
+        AIMessage("Both refunds were issued after review: $476.26 for the duplicate charge and "
+                  "$119.05 for the lost box, $595.31 in total."),
     ])
     paused = await service.start_case(MAYA, "Charged twice and a box is missing.", case_id=CASE)
 
@@ -80,13 +81,15 @@ async def test_flagship_refunds_wait_for_approval_then_execute(client, app):
     done = await service.submit_decisions(CASE, REVIEWER, [{"type": "approve"}, {"type": "approve"}])
     assert done.status == "completed"
     ledger = app.state.store.ledger
-    assert [(e["reasonCode"], e["amountCents"], e["approvedBy"], e["caseId"]) for e in ledger] == [
+    # The two approved refunds execute in parallel, so their order is not fixed.
+    assert sorted((e["reasonCode"], e["amountCents"], e["approvedBy"], e["caseId"]) for e in ledger) == [
         ("duplicate_charge", 47626, REVIEWER, CASE),
         ("lost_package", 11905, REVIEWER, CASE),
     ]
-    assert [r["refundId"] for r in done.receipts] == ["RF-90001", "RF-90002"]
+    assert sorted(r["refundId"] for r in done.receipts) == ["RF-90001", "RF-90002"]
     assert {e["onBehalfOf"] for e in app.state.store.access_log} == {MAYA}
-    assert done.reply.startswith("Refunds RF-90001")
+    assert done.reply.startswith("Both refunds were issued")
+    assert done.guardrail_events == []
 
 
 async def test_reviewer_can_lower_the_amount(client, app):
